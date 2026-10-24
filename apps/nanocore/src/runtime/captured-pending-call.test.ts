@@ -16,6 +16,8 @@ import {
 } from '@openkit/protocol';
 import { Hono } from 'hono';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { StartedCapabilityCall } from '../capability/usage-ledger.js';
+import * as usageLedger from '../capability/usage-ledger.js';
 import { createInMemoryRuntimeConfigSnapshot } from '../config/runtime-config.js';
 import { readAdmittedPolicyDocument, recordPolicyWriteDecision } from '../policy/configuration.js';
 import { PolicyInterception } from '../policy/interception.js';
@@ -31,7 +33,7 @@ import {
 } from '../policy/statements.js';
 import { createSchedulerAdmissionEntry } from '../scheduler-records.js';
 import { shutdownControlStoreWorkerClient } from '../storage/control-store-worker-client.js';
-import { openCoreDb, openWorkspaceDb } from '../storage/db.js';
+import { type CoreDb, openCoreDb, openWorkspaceDb, type WorkspaceDb } from '../storage/db.js';
 import { applyMigrations, applyScopedMigrations } from '../storage/migrate.js';
 import { createTestAgentSetup } from '../test-support/agent-environment.js';
 import { createDemoStore } from '../test-support/demo-store.js';
@@ -63,7 +65,11 @@ import {
   recordMcpToolSchemaSnapshot,
 } from './mcp-tool-schema-snapshots.js';
 import { raiseRecordedPendingRequest, respondRecordedApproval } from './pending-request-flow.js';
-import { executionCallIdForRequest, readPendingRequest } from './pending-requests.js';
+import {
+  executionCallIdForRequest,
+  type PendingRequestRecord,
+  readPendingRequest,
+} from './pending-requests.js';
 import type { WorkerControlGateway } from './worker-control-gateway.js';
 import type { WorkerMcpGateway } from './worker-mcp-gateway.js';
 
@@ -461,6 +467,146 @@ function expectNoContactAfterClaim(f: ReturnType<typeof fixture>) {
   expect(f.db.sqlite.prepare('SELECT count(*) AS count FROM usage_records').get()).toEqual({
     count: 0,
   });
+}
+
+const workspaceCallId = '00000000-0000-4000-8000-000000000119';
+const workspaceCallIdForGrant = 'grant_00000000-0000-7278-b714-46e2d53cb316';
+const workspaceCallReferenceId = testEntityId('vault', 'captured-workspace-call-credential');
+const workspaceCallWorkspaceId = 'ws_00000000-0000-7000-8000-000000000001';
+
+/** Isolates the dispatch freshness gate from the POSIX Vault directory requirement. */
+function workspaceExecutionFixture() {
+  const catalog = (endpoint: string): WorkspaceMcpServerCatalog => ({
+    schemaVersion: 1,
+    servers: [
+      {
+        id: 'echo-server',
+        enabled: true,
+        transport: { kind: 'http', endpoint, headers: {} },
+        credentialBindings: [
+          {
+            slot: 'auth',
+            sink: { kind: 'header', name: 'Authorization' },
+            presentation: 'bearer',
+            vaultGrantId: workspaceCallIdForGrant,
+          },
+        ],
+        allowedTools: ['echo'],
+        timeoutMs: 2000,
+        schemaPolicy: 'tracking',
+        pinnedSchemaSnapshotId: null,
+      },
+    ],
+  });
+  const capturedCatalog = catalog('https://original.example.test/mcp');
+  let currentCatalog = capturedCatalog;
+  let currentReferenceVersion = 1;
+  const referenceRow = {
+    reference_id: workspaceCallReferenceId,
+    owner_scope: 'workspace',
+    workspace_id: workspaceCallWorkspaceId,
+    user_id: null,
+    display_name: 'Captured Workspace credential',
+    secret_kind: 'mcp-credential',
+    backend_kind: 'encrypted-file',
+    backend_locator: null,
+    status: 'active',
+    get current_version() {
+      return currentReferenceVersion;
+    },
+    created_at: '2026-10-25T00:00:00.000Z',
+    updated_at: '2026-10-25T00:00:00.000Z',
+  };
+  const grantRow = {
+    schemaVersion: 1,
+    grant_id: workspaceCallIdForGrant,
+    issuance: 'target',
+    vault_reference_id: workspaceCallReferenceId,
+    owner_scope: 'workspace',
+    workspace_id: workspaceCallWorkspaceId,
+    user_id: null,
+    subject_summary: null,
+    target_agent_id: 'agent_demo',
+    target_agent_session_id: null,
+    target_capability_id: 'mcp.call-tool',
+    allowed_injection_paths: '["gateway-only"]',
+    lifetime: 'workspace',
+    policy_decision_id: null,
+    approval_id: null,
+    status: 'active',
+    created_at: '2026-10-25T00:00:00.000Z',
+    expires_at: null,
+  };
+  const coreDb = {
+    sqlite: {
+      prepare: (query: string) => ({
+        get: () =>
+          query.includes('FROM vault_grants')
+            ? grantRow
+            : query.includes('FROM vault_references')
+              ? referenceRow
+              : undefined,
+      }),
+    },
+  } as unknown as CoreDb;
+  const sqlite = {
+    transaction: (operation: () => void) => () => operation(),
+  } as unknown as WorkspaceDb['sqlite'];
+  const workspaceDb = { sqlite, workspaceId: workspaceCallWorkspaceId } as WorkspaceDb;
+  const record = {
+    agentId: 'agent_demo',
+    agentSessionId: null,
+    canonicalArgumentsJson: JSON.stringify({ message: 'approved' }),
+    catalogRevision: resolveWorkspaceMcpServer({
+      catalog: capturedCatalog,
+      serverId: 'echo-server',
+    }).catalogDigest,
+    packageDigest: null,
+    serverId: 'echo-server',
+    toolName: 'echo',
+    workspaceId: workspaceCallWorkspaceId,
+  } as PendingRequestRecord;
+  const executionCall: StartedCapabilityCall = {
+    id: workspaceCallId,
+    inserted: true,
+    context: {} as StartedCapabilityCall['context'],
+  };
+  const prepared: PreparedCapturedPendingCall = {
+    credentials: { bearer: 'prepared-workspace-credential' },
+    grants: [{ id: workspaceCallIdForGrant, referenceId: workspaceCallReferenceId, version: 1 }],
+    failed: false,
+  };
+  const callTool = vi.fn<WorkerMcpGateway['callTool']>().mockResolvedValue({
+    content: [{ type: 'text', text: 'called' }],
+    isError: false,
+  });
+  const gateway = { callTool } as unknown as WorkerMcpGateway;
+  const settleCall = vi.spyOn(usageLedger, 'finishMcpToolCall').mockResolvedValue(undefined);
+
+  return {
+    callTool,
+    executionCall,
+    settleCall,
+    scope: () =>
+      resolveWorkspaceMcpServer({ catalog: currentCatalog, serverId: 'echo-server' }).scope,
+    setEndpoint: (endpoint: string) => {
+      currentCatalog = catalog(endpoint);
+    },
+    setReferenceVersion: (version: number) => {
+      currentReferenceVersion = version;
+    },
+    execute: () =>
+      executeCapturedPendingCall({
+        catalog: currentCatalog,
+        coreDb,
+        record,
+        workerMcpGateway: gateway,
+        workspaceDb,
+        prepared,
+        executionCall,
+      }),
+    workspaceDb,
+  };
 }
 
 describe('captured pending MCP schema identity at grant', () => {
@@ -1080,6 +1226,58 @@ describe('captured pending MCP schema identity at grant', () => {
     expect(f.db.sqlite.prepare('SELECT quantity FROM usage_records').all()).toEqual([
       { quantity: 1 },
     ]);
+  });
+
+  it('refuses Workspace credentials prepared for an endpoint that changes before dispatch', async () => {
+    const f = workspaceExecutionFixture();
+    f.setEndpoint('https://changed.example.test/mcp');
+    expect(await f.execute()).toMatchObject({
+      disposition: 'execution-error',
+      reason: 'credentials-invalid',
+    });
+    expect(f.callTool).not.toHaveBeenCalled();
+    expect(f.settleCall).toHaveBeenCalledWith(
+      f.executionCall,
+      f.workspaceDb,
+      { status: 'failed', errorCode: 'credentials-invalid' },
+      false
+    );
+  });
+
+  it('executes a Workspace credential when its captured endpoint and Vault version remain current', async () => {
+    const f = workspaceExecutionFixture();
+    expect(f.scope()).toBeUndefined();
+    expect(await f.execute()).toMatchObject({ disposition: 'approved-executed' });
+    expect(f.callTool).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        credentials: { bearer: 'prepared-workspace-credential' },
+        server: expect.objectContaining({
+          transport: expect.objectContaining({ endpoint: 'https://original.example.test/mcp' }),
+        }),
+      })
+    );
+    expect(f.settleCall).toHaveBeenCalledWith(
+      f.executionCall,
+      f.workspaceDb,
+      { status: 'succeeded', errorCode: null },
+      true
+    );
+  });
+
+  it('refuses Workspace credentials prepared before the Vault reference rotates', async () => {
+    const f = workspaceExecutionFixture();
+    f.setReferenceVersion(2);
+    expect(await f.execute()).toMatchObject({
+      disposition: 'execution-error',
+      reason: 'credentials-invalid',
+    });
+    expect(f.callTool).not.toHaveBeenCalled();
+    expect(f.settleCall).toHaveBeenCalledWith(
+      f.executionCall,
+      f.workspaceDb,
+      { status: 'failed', errorCode: 'credentials-invalid' },
+      false
+    );
   });
 
   it.each([

@@ -432,9 +432,9 @@ export async function executeCapturedPendingCall(input: {
     });
   }
   if (
-    resolved.scope === 'server' &&
-    (resolved.catalogDigest !== record.catalogRevision ||
-      !credentialsStillValid(input.coreDb, resolved, record, input.prepared) ||
+    resolved.catalogDigest !== record.catalogRevision ||
+    !credentialsStillValid(input.coreDb, resolved, record, input.prepared) ||
+    (resolved.scope === 'server' &&
       resolved.credentialBindings.some((binding) => {
         const grant = input.coreDb ? getVaultGrant(input.coreDb, binding.vaultGrantId) : null;
         const reference =
